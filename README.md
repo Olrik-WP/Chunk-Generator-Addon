@@ -18,7 +18,7 @@ This can either be done manually by the user for each chunk they want to save, o
 1) Download the addon by [clicking here](https://raw.githubusercontent.com/Amulet-Team/Chunk-Generator-Addon/main/ChunkGenerator.mcpack)
 2) Double-click the downloaded file to open it in Minecraft Bedrock Edition.
 3) Open the worlds list in Minecraft Bedrock Edition
-4) Click the pencil icon on the world you want to generate terrain in (or click create a new world)
+4) Click the pencil icon on the world you want to generate terrain in (or click `Create new world`)
 
 ![world scren](resource/world_screen.jpg)
 
@@ -50,9 +50,9 @@ Scroll down and click `Submit` to confirm the selection.
 Alternatively, you can travel to the bounds of the area you want to generate and click `Extend to My Position` at each edge.
 The selection will expand to include your current position.
 
-If you make a mistake you can click `Clear Selection` to delete the selection.
+If you make a mistake, you can click `Clear Selection` to delete the selection.
 
-Once you are happy with the selection, double-check the coordinates and the number of chunks that will be generated.
+Once you are happy with the selection, double-check the coordinates and the number of chunks that will be generated to make sure they look correct.
 
 ![selection](resource/selection.jpg)
 
@@ -79,4 +79,5 @@ or just type `/chunk_generator:stop` in the chat.
 
 My computer was able to generate 4096 chunks (1024x1024 blocks) in under 25 seconds.
 This is much faster than other chunk generators I have seen.
+
 Note: Your computer is probably slower than mine, so don't expect to get the same speed.
