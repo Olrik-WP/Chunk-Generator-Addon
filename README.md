@@ -75,6 +75,18 @@ or just type `/chunk_generator:stop` in the chat.
 
 ![after](resource/after.jpg)
 
+## Some chunks are missing in game. How do I fix this?
+
+![missing chunks](resource/missing_chunks.jpg)
+
+We call these void chunks. They are chunks that exist but only contain air.
+They are most commonly created in Amulet by modifying a chunk that does not exist.
+Amulet will populate the chunk with air so that it has something to apply the changes to.
+This addon can only create terrain when the chunk does not exist.
+
+If you want to generate terrain in these chunks, you will first need to delete the whole chunk
+(eg in Amulet's chunk tool) then generate the terrain using this addon.
+
 ## How long does it take to generate chunks?
 
 My computer was able to generate 4096 chunks (1024x1024 blocks) in under 25 seconds.
