@@ -71,6 +71,24 @@ system.beforeEvents.startup.subscribe(
 		);
 		init.customCommandRegistry.registerCommand(
 			{
+				name: "chunk_generator:radius",
+				description: "Radius selection",
+				permissionLevel: CommandPermissionLevel.Any,
+				mandatoryParameters: [
+					{ name: "radius", type: CustomCommandParamType.Integer },
+				],
+			},
+			(origin, radius) => {
+				const player = origin.sourceEntity;
+				if (player && player.typeId === "minecraft:player") {
+					system.run(() => {
+						setRadius(player, radius);
+					});
+				}
+			}
+		);
+		init.customCommandRegistry.registerCommand(
+			{
 				name: "chunk_generator:stop",
 				description: "Stop Generating Chunks",
 				permissionLevel: CommandPermissionLevel.Any,
@@ -206,6 +224,20 @@ function showEditForm(player) {
 	});
 }
 
+function setRadius(player, radius){
+	const loc = player.location;
+	const selection = {
+		minX: loc.x - radius / 2,
+		maxX: loc.x + radius / 2,
+		minZ: loc.z - radius / 2,
+		maxZ: loc.z + radius / 2,
+	};
+
+	setSelection(player, selection);
+	player.sendMessage(`§aSelection set be a radius ${radius} around (${loc.x}, ${loc.z}).`);
+	showMainMenu(player);
+}
+
 function extendToPlayer(player) {
 	const loc = player.location;
 	const x = Math.floor(loc.x);
@@ -276,16 +308,23 @@ async function startGeneration(player, minChunkX, maxChunkX, minChunkZ, maxChunk
 	let chunks_generated = 0;
 	let sections_generated = 0;
 	let sectionCount = Math.ceil((maxChunkX - minChunkX)/SECTION_CHUNKS) * Math.ceil((maxChunkZ - minChunkZ)/SECTION_CHUNKS);
+
+	const old_player_loc = player.location;
 	
 	player.setDynamicProperty(GENERATING_PROPERTY, true);
 	
 	for (let section_cx_min = minChunkX; section_cx_min < maxChunkX; section_cx_min += SECTION_CHUNKS) {
+		console.log(`section_cx_min: ${section_cx_min}`);
 		const section_cx_max = Math.min(section_cx_min + SECTION_CHUNKS, maxChunkX);
 		
 		for (let section_cz_min = minChunkZ; section_cz_min < maxChunkZ; section_cz_min += SECTION_CHUNKS) {
+			console.log(`section_cz_min: ${section_cz_min}`);
 			const section_cz_max = Math.min(section_cz_min + SECTION_CHUNKS, maxChunkZ);
 			
-			if (!player.isValid) return;
+			if (!player.isValid) {
+				console.warn("player is invalid!");
+				return;
+			}
 			
 			if (!player.getDynamicProperty(GENERATING_PROPERTY)) {
 				player.sendMessage(`§aGeneration canceled: ${chunks_generated}/${total} chunks processed.`);
@@ -307,6 +346,11 @@ async function startGeneration(player, minChunkX, maxChunkX, minChunkZ, maxChunk
 					z: section_cz_max * CHUNK_SIZE - 1
 				},
 			};
+			player.teleport({
+				x: section_cx_min * CHUNK_SIZE,
+				y: 200,
+				z: section_cz_min * CHUNK_SIZE
+			});
 
 			if (!manager.hasCapacity(options)) {
 				player.sendMessage(`§cSection ${sections_generated}/${sectionCount} is too large for the ticking-area budget — skipped.`);
@@ -314,14 +358,18 @@ async function startGeneration(player, minChunkX, maxChunkX, minChunkZ, maxChunk
 			}
 
 			try {
+				console.log("creating ticking area...");
 				await manager.createTickingArea(tickingAreaId, options);
+				console.log("creating ticking area... ok");
 			} catch (e) {
 				player.sendMessage(`§cCouldn't load section ${sections_generated}/${sectionCount}: ${e}`);
 				continue;
 			}
 
 			for (let x = section_cx_min; x < section_cx_max; x++) {
+				console.log(`x: ${x}`);
 				for (let z = section_cz_min; z < section_cz_max; z++) {
+					console.log(`z: ${z}`);
 					const block = dimension.getBlock({
 						x: x * CHUNK_SIZE + HALF_CHUNK_SIZE,
 						y: maxY - 1,
@@ -338,7 +386,10 @@ async function startGeneration(player, minChunkX, maxChunkX, minChunkZ, maxChunk
 				}
 			}
 
+			console.log("removing ticking area...");
 			manager.removeTickingArea(tickingAreaId);
+			console.log("removing ticking area... ok");
+			player.teleport(old_player_loc);
 			player.sendMessage(`§7Section ${sections_generated}/${sectionCount} done — ${chunks_generated}/${total} chunks so far.`);
 		}
 	}
