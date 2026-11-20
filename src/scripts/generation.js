@@ -2,6 +2,7 @@ const CHUNK_SIZE = 16;
 const SECTION_CHUNKS = 8;
 const GENERATING_PROPERTY = "chunk_generator:generating";
 const RECOVERY_PROPERTY = "chunk_generator:recovery";
+const BACKGROUND_AREAS_PROPERTY = "chunk_generator:pending_areas";
 const AREA_PREFIX = "chunk_generator:job_";
 const EFFECT_TICKS = 1200;
 const EFFECT_RESERVE = 100;
@@ -71,12 +72,14 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 	let ready = false;
 	let record;
 	let storageError;
+	let recoveryProblem;
 	let active;
 	let recovering = false;
 	let sequence = 0;
 	let barrier;
 	let resourcesScanned = false;
 	const pendingAreas = new Set();
+	const backgroundAreas = new Set();
 	const staleAreas = new Set();
 
 	const errorText = error => typeof error?.message === "string" ? error.message : String(error);
@@ -88,18 +91,31 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 	function save() {
 		world.setDynamicProperty(RECOVERY_PROPERTY, JSON.stringify(record));
 	}
+	function saveBackground() {
+		world.setDynamicProperty(BACKGROUND_AREAS_PROPERTY, backgroundAreas.size ? JSON.stringify([...backgroundAreas]) : undefined);
+	}
 	function attempt(context, action) {
 		try { return action(); }
 		catch (error) { logError(context, error); return false; }
 	}
-	function onlinePlayer() {
-		return world.getAllPlayers().find(player => player.id === record?.playerId && player.isValid);
+	function onlinePlayer(playerId = record?.playerId) {
+		return world.getAllPlayers().find(player => player.id === playerId && player.isValid);
 	}
 	function finishRecovery() {
-		if (!record || record.returnPending || record.flagPending || record.pendingBlock ||
-			record.areaIds.length || pendingAreas.size || record.effects.some(effect => effect.owned)) return false;
+		if (!record || record.returnPending || record.flagPending || record.pendingBlock || record.effects.some(effect => effect.owned)) return false;
+		const detached = record.areaIds.filter(id => pendingAreas.has(id) && !world.tickingAreaManager.hasTickingArea(id));
+		if (detached.length) {
+			// Player, effects and blocks are recovered; the actual areas are gone.
+			// Persist late-load ownership BEFORE releasing the foreground journal.
+			for (const id of detached) backgroundAreas.add(id);
+			saveBackground();
+			record.areaIds = record.areaIds.filter(id => !detached.includes(id));
+			save();
+		}
+		if (record.areaIds.length) return false;
 		world.setDynamicProperty(RECOVERY_PROPERTY, undefined);
 		record = undefined;
+		recoveryProblem = undefined;
 		return true;
 	}
 	function removeArea(id) {
@@ -109,6 +125,10 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		// Removal can reject the native load promise and release its resources.
 		// Keep the late-completion observer and journal until that promise settles.
 		if (pendingAreas.has(id)) return false;
+		if (backgroundAreas.delete(id)) {
+			try { saveBackground(); }
+			catch (error) { backgroundAreas.add(id); throw error; }
+		}
 		staleAreas.delete(id);
 		if (record?.areaIds.includes(id)) {
 			record.areaIds = record.areaIds.filter(value => value !== id);
@@ -117,7 +137,23 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		return true;
 	}
 	function removeAreas() {
-		for (const id of new Set([...(record?.areaIds ?? []), ...staleAreas])) attempt(`Removing ${id}`, () => removeArea(id));
+		for (const id of new Set([...(record?.areaIds ?? []), ...backgroundAreas, ...staleAreas])) attempt(`Removing ${id}`, () => removeArea(id));
+	}
+	function backgroundMessage() {
+		return backgroundAreas.size ? `${backgroundAreas.size} old area request(s) monitored in background; new generation is available.` : "You can start a new generation.";
+	}
+	function blockedGuidance(player) {
+		if (active) return active.player.id === player.id ?
+			"Generation is still running. Wait for section progress, or use /chunk_generator:stop to cancel." :
+			`Generation is running for ${record?.playerName ?? "another player"}. Wait until it finishes; /chunk_generator:stop cancels only your own generation.`;
+		if (storageError) return "Saved recovery could not be read. Ask the server administrator to check the [Chunk Generator] console error; do not delete recovery data blindly.";
+		if (recovering) return "Recovery is already retrying. Keep the affected player online and wait for the recovery result.";
+		if (!record) return "Area cleanup is still failing. Use /chunk_generator:stop to retry; if it persists, ask the server administrator to check the console error.";
+		if (record.playerId !== player.id || !player.isValid) return `Recovery belongs to ${record.playerName ?? "another player"}. That player must reconnect; recovery then retries automatically.`;
+		if (record.returnPending) return `Return pending at (${coordinates(record.origin.location)}) in ${record.origin.dimensionId}. Restore the floor/clear obstructions there, stay online, then use /chunk_generator:stop to retry. If it persists, ask the server administrator.${recoveryProblem ? ` Reason: ${recoveryProblem.slice(0, 180)}` : ""}`;
+		if (record.pendingBlock) return `Temporary block restoration pending at (${coordinates(record.pendingBlock.location)}). Use /chunk_generator:stop to retry; if it persists, give these coordinates and the console error to the server administrator.`;
+		if (record.effects.some(effect => effect.owned)) return "Temporary effect cleanup is pending. Stay online and use /chunk_generator:stop to retry; if it persists, ask the server administrator to check the console error.";
+		return `Cleanup pending: ${recoveryDetails()}. Use /chunk_generator:stop to retry; if it persists, ask the server administrator to check the console error.`;
 	}
 	function recoveryDetails() {
 		if (!record) return "";
@@ -211,7 +247,8 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		}
 		for (const cell of landing.supports) {
 			const block = loadedBlock(dimension, cell.location);
-			if (signature(block) !== cell.signature) throw new Error(`Return support or its neighbor changed at (${coordinates(cell.location)}); current block: ${block.typeId}`);
+			const current = signature(block);
+			if (current !== cell.signature) throw new Error(`Return support or its neighbor changed at (${coordinates(cell.location)}); expected ${cell.signature}; current ${current}`);
 		}
 	}
 	function captureLanding(player) {
@@ -258,7 +295,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		if (!player.tryTeleport(origin.location, { dimension: player.dimension, rotation: origin.rotation, keepVelocity: false, checkForBlocks: true })) {
 			throw new Error(`Bedrock rejected the return collision check at (${coordinates(origin.location)}); no remote teleport was started`);
 		}
-		verifyTeleport(player, origin.location, player.dimension, origin.rotation);
+		verifyTeleport(player, origin.location, player.dimension);
 	}
 	function clearBody(dimension, location, requireSupport) {
 		const { min, max } = dimension.heightRange;
@@ -275,32 +312,34 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		}
 		return true;
 	}
-	function verifyTeleport(player, location, dimension, rotation) {
+	function verifyTeleport(player, location, dimension) {
 		const actual = player.location;
-		const facing = player.getRotation();
-		const angleDifference = (a, b) => Math.abs(((a - b + 540) % 360) - 180);
+		// Input and engine angle normalization may change the camera immediately.
+		// Rotation is requested best-effort, never used as a position/safety gate.
 		if (player.dimension.id !== dimension.id ||
-			["x", "y", "z"].some(axis => Math.abs(actual[axis] - location[axis]) > 0.05) ||
-			angleDifference(facing.x, rotation.x) > 0.1 || angleDifference(facing.y, rotation.y) > 0.1) {
-			throw new Error(`Teleport result mismatch: requested ${dimension.id} (${coordinates(location)}), rotation=(${rotation.x.toFixed(3)}, ${rotation.y.toFixed(3)}); actual ${player.dimension.id} (${coordinates(actual)}), rotation=(${facing.x.toFixed(3)}, ${facing.y.toFixed(3)})`);
+			["x", "y", "z"].some(axis => Math.abs(actual[axis] - location[axis]) > 0.05)) {
+			throw new Error(`Teleport position mismatch: requested ${dimension.id} (${coordinates(location)}); actual ${player.dimension.id} (${coordinates(actual)})`);
 		}
 	}
 	function teleport(player, location, dimension, rotation, checkForBlocks) {
 		player.teleport(location, { dimension, rotation, checkForBlocks, keepVelocity: false });
-		verifyTeleport(player, location, dimension, rotation);
+		verifyTeleport(player, location, dimension);
 	}
 	function returnPlayer(player) {
 		if (!record.returnPending) return true;
 		if (!player?.isValid) return false;
-		const origin = record.origin;
-		const dimension = world.getDimension(origin.dimensionId);
-		if (origin.landing) inspectLanding(dimension, origin.landing);
-		else if (!clearBody(dimension, origin.location, true)) throw new Error("Legacy return position is obstructed, unsafe, or not loaded; recovery retained");
-		teleport(player, origin.location, dimension, origin.rotation, true);
-		attempt("Extinguishing fire after return", () => player.extinguishFire());
-		record.returnPending = false;
-		save();
-		return true;
+		try {
+			const origin = record.origin;
+			const dimension = world.getDimension(origin.dimensionId);
+			if (origin.landing) inspectLanding(dimension, origin.landing);
+			else if (!clearBody(dimension, origin.location, true)) throw new Error("Legacy return position is obstructed, unsafe, or not loaded; recovery retained");
+			teleport(player, origin.location, dimension, origin.rotation, true);
+			attempt("Extinguishing fire after return", () => player.extinguishFire());
+			record.returnPending = false;
+			save();
+			recoveryProblem = undefined;
+			return true;
+		} catch (error) { recoveryProblem = errorText(error); throw error; }
 	}
 	function emergencyReturn(player) {
 		if (!record?.returnPending || !player?.isValid) return;
@@ -331,6 +370,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		check(job);
 	}
 	async function loadArea(id, options, job) {
+		const owner = record;
 		if (!record.areaIds.includes(id)) { record.areaIds.push(id); save(); }
 		let abandoned = false;
 		pendingAreas.add(id);
@@ -338,9 +378,14 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		const tracked = creation.finally(() => {
 			pendingAreas.delete(id);
 			if (abandoned) {
+				const wasBackground = backgroundAreas.has(id);
 				attempt(`Late cleanup of ${id}`, () => removeArea(id));
-				if (!active && !recovering) {
-					const player = attempt("Finding cleanup player", onlinePlayer);
+				const player = attempt("Finding cleanup player", () => onlinePlayer(owner.playerId));
+				if (wasBackground && !backgroundAreas.has(id)) {
+					message(player, "§7Background ticking-area cleanup complete.");
+					logger.log(`[Chunk Generator] Background ticking-area cleanup complete: ${id}`);
+				}
+				if (!active && !recovering && record === owner) {
 					if (attempt("Finishing late recovery", finishRecovery)) {
 						message(player, "§7Pending ticking-area cleanup complete.");
 						logger.log("[Chunk Generator] Pending ticking-area cleanup complete.");
@@ -436,6 +481,12 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 	function initialize() {
 		if (ready) return;
 		try {
+			const pendingRaw = world.getDynamicProperty(BACKGROUND_AREAS_PROPERTY);
+			if (pendingRaw !== undefined) {
+				const saved = JSON.parse(pendingRaw);
+				if (!Array.isArray(saved) || !saved.every(id => typeof id === "string" && id.startsWith(AREA_PREFIX))) throw new Error("Invalid background area journal; it was retained");
+				for (const id of saved) backgroundAreas.add(id);
+			}
 			const raw = world.getDynamicProperty(RECOVERY_PROPERTY);
 			if (raw !== undefined) {
 				record = JSON.parse(raw);
@@ -450,6 +501,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		} catch (error) { storageError = error; logError("Initializing recovery", error); }
 		if (!storageError) attempt("Inspecting stale ticking areas", () => {
 			resourcesScanned = scanStaleAreas();
+			for (const id of [...backgroundAreas]) attempt(`Cleaning saved background area ${id}`, () => removeArea(id));
 			if (record) save();
 			else for (const player of world.getAllPlayers()) attempt("Resetting stale generation flag", () => resetFlag(player));
 		});
@@ -468,12 +520,18 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		}
 		return true;
 	}
-	async function recover(player) {
+	async function recover(player, report = false) {
 		initialize();
-		if (active || recovering || storageError) return false;
-		if (!record) { if (player) attempt("Resetting stale generation flag", () => resetFlag(player)); return true; }
+		if (active || recovering || storageError) { if (report) message(player, `§e${blockedGuidance(player)}`); return false; }
+		if (!record) {
+			if (!resourcesScanned) resourcesScanned = scanStaleAreas();
+			removeAreas();
+			if (player) attempt("Resetting stale generation flag", () => resetFlag(player));
+			if (report) message(player, `§7No active player recovery. ${resourcesScanned && !staleAreas.size ? backgroundMessage() : blockedGuidance(player)}`);
+			return resourcesScanned && !staleAreas.size;
+		}
 		if (!player) player = attempt("Finding recovery player", onlinePlayer);
-		if (player && player.id !== record.playerId) return false;
+		if (player && player.id !== record.playerId) { if (report) message(player, `§e${blockedGuidance(player)}`); return false; }
 		recovering = true;
 		try {
 			if (player?.isValid && record.travelStarted && !record.returnPending &&
@@ -514,10 +572,12 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			}
 			removeAreas();
 			if (attempt("Finishing recovery", finishRecovery)) {
-				message(player, "§7Recovery and cleanup complete.");
-				logger.log("[Chunk Generator] Recovery and cleanup complete.");
+				const outcome = backgroundAreas.size ? `Player recovery complete. ${backgroundMessage()}` : "Recovery and cleanup complete.";
+				message(player, `§7${outcome}`);
+				logger.log(`[Chunk Generator] ${outcome}`);
 			}
 			recovering = false;
+			if (report && record) message(player, `§e${blockedGuidance(player)}`);
 		}
 		return !record;
 	}
@@ -594,8 +654,8 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			if (!resourcesScanned) resourcesScanned = scanStaleAreas();
 			removeAreas();
 		}
-		if (active || recovering || record || pendingAreas.size || staleAreas.size || !resourcesScanned || storageError) {
-			message(player, "§cAnother generation or a pending recovery is still in progress. The affected player must be online for recovery.");
+		if (active || recovering || record || staleAreas.size || !resourcesScanned || storageError) {
+			message(player, `§c${blockedGuidance(player)}`);
 			return { status: "refused" };
 		}
 		const bounds = [minChunkX, maxChunkX, minChunkZ, maxChunkZ];
@@ -707,17 +767,20 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			}
 			active = undefined;
 			attempt("Finishing cleanup", finishRecovery);
-			result.recoveryPending = !!record;
-			if (result.recoveryPending && result.status === "complete") result.status = "recovery_pending";
-			const summary = `Generation ${result.status}: ${result.processed}/${total} chunks processed. Sections: ${result.successful} successful, ${result.partial} partial, ${result.failed} failed, ${result.cancelled} canceled, ${result.notStarted} not started. BDS handles world saves.${record ? ` Pending cleanup: ${recoveryDetails()}.` : " Cleanup complete."}`;
+			result.recoveryPending = !!record || backgroundAreas.size > 0;
+			result.generationBlocked = !!record;
+			if (record && result.status === "complete") result.status = "recovery_pending";
+			const summary = `Generation ${result.status}: ${result.processed}/${total} chunks processed. Sections: ${result.successful} successful, ${result.partial} partial, ${result.failed} failed, ${result.cancelled} canceled, ${result.notStarted} not started. BDS handles world saves.${record ? ` Pending cleanup: ${recoveryDetails()}. ${blockedGuidance(player)}` : backgroundAreas.size ? ` Player recovery complete. ${backgroundMessage()}` : " Cleanup complete."}`;
 			message(player, `${result.status === "complete" ? "§a" : "§e"}${summary}`);
 			logger.log(`[Chunk Generator] ${summary}`);
 		}
 		return result;
 	}
 	function stop(player) {
-		if (active?.player.id === player.id) cancel(active, "Canceled by player");
-		else void recover(player);
+		if (active?.player.id === player.id) {
+			message(player, "§7Cancellation requested. Returning the player and cleaning up; keep connected until the result.");
+			cancel(active, "Canceled by player");
+		} else void recover(player, true);
 	}
 	function onLeave(playerId) {
 		if (active?.player.id === playerId) cancel(active, "Player disconnected");

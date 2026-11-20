@@ -131,10 +131,11 @@ test("area-only cleanup explains what is pending and never teleports a returned 
 	h.controller.stop(h.player);
 	const result = await h.settle(work);
 	assert.equal(result.recoveryPending, true);
-	assert.equal(h.record().returnPending, false);
+	assert.equal(h.record(), undefined);
+	assert.equal(result.generationBlocked, false);
 	assert.equal(h.effects.size, 0);
 	assert.equal(h.areas.size, 0);
-	assert.ok(h.messages.some(text => text.includes("Pending cleanup: 1 ticking-area load(s) still settling")));
+	assert.ok(h.messages.some(text => text.includes("1 old area request(s) monitored in background; new generation is available")));
 	const walkedTo = { ...h.origin, x: h.origin.x + 5 };
 	h.player.location = { ...walkedTo };
 	await h.settle(h.controller.recover(h.player));
@@ -143,5 +144,5 @@ test("area-only cleanup explains what is pending and never teleports a returned 
 	await h.flush();
 	assert.deepEqual(h.player.location, walkedTo);
 	assert.equal(h.record(), undefined);
-	assert.ok(h.messages.some(text => text.includes("Pending ticking-area cleanup complete")));
+	assert.ok(h.messages.some(text => text.includes("Background ticking-area cleanup complete")));
 });

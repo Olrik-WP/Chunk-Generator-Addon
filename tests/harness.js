@@ -83,7 +83,8 @@ export function harness(options = {}) {
 		tryTeleport(location, settings) {
 			events.push({ kind: "collision-probe", location, settings, protected: !!getEffect("minecraft:resistance") && !!getEffect("minecraft:slow_falling") });
 			if (options.collisionProbe?.(location, settings, h) === false) return false;
-			this.location = { ...location }; this.dimension = settings.dimension; this.rotation = { ...settings.rotation };
+			this.location = { ...location }; this.dimension = settings.dimension;
+			this.rotation = { ...(options.rotationResult?.({ ...settings.rotation }, location, h) ?? settings.rotation) };
 			this.velocity = { x: 0, y: 0, z: 0 };
 			return true;
 		},
@@ -106,7 +107,8 @@ export function harness(options = {}) {
 			if (!this.isValid) throw new Error("Invalid player");
 			events.push({ kind: "teleport", location: { ...location }, settings, protected: !!getEffect("minecraft:resistance") && !!getEffect("minecraft:slow_falling") });
 			if (options.teleport?.(location, settings, h) === false) return;
-			this.location = { ...location }; this.dimension = settings.dimension; this.rotation = { ...settings.rotation };
+			this.location = { ...location }; this.dimension = settings.dimension;
+			this.rotation = { ...(options.rotationResult?.({ ...settings.rotation }, location, h) ?? settings.rotation) };
 			if (settings.keepVelocity === false) this.velocity = { x: 0, y: 0, z: 0 };
 		},
 		sendMessage(text) { if (!this.isValid) throw new Error("Invalid player"); messages.push(text); },

@@ -4,7 +4,7 @@ $ProjectRoot = $PSScriptRoot
 $Source = Join-Path $ProjectRoot "src"
 $ManifestPath = Join-Path $Source "manifest.json"
 $PackName = "Chunk Generator - aceinetx"
-$BaseName = "ChunkGenerator-aceinetx-v1.0.4"
+$BaseName = "ChunkGenerator-aceinetx-v1.0.5"
 $Output = Join-Path $ProjectRoot "$BaseName.mcpack"
 $TempZip = Join-Path $ProjectRoot "$BaseName.$([guid]::NewGuid().ToString('N')).build.zip"
 $RequiredFiles = @("manifest.json", "scripts/main.js", "scripts/generation.js", "pack_icon.png")
@@ -17,8 +17,8 @@ foreach ($RelativePath in $RequiredFiles) {
 
 # A build validates metadata; it must not rewrite the source manifest.
 $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-if ($Manifest.header.name -cne $PackName -or ($Manifest.header.version -join ".") -ne "1.0.4") {
-    throw "Expected pack name '$PackName', version 1.0.4."
+if ($Manifest.header.name -cne $PackName -or ($Manifest.header.version -join ".") -ne "1.0.5") {
+    throw "Expected pack name '$PackName', version 1.0.5."
 }
 if ($Manifest.header.uuid -ne "9896eaf3-0251-496a-a122-54d44e04cd17") {
     throw "The existing pack UUID must be preserved."
@@ -32,7 +32,7 @@ if ($Manifest.modules.Count -ne 2 -or @($Manifest.modules.type | Select-Object -
 }
 foreach ($Module in $Manifest.modules) {
     if (-not $ModuleIds.ContainsKey($Module.type) -or $Module.uuid -ne $ModuleIds[$Module.type] -or
-        ($Module.version -join ".") -ne "1.0.4") {
+        ($Module.version -join ".") -ne "1.0.5") {
         throw "Module UUID or version was changed: $($Module.type)"
     }
     if ($Module.type -eq "script" -and ($Module.entry -ne "scripts/main.js" -or $Module.language -ne "javascript")) {
@@ -106,5 +106,5 @@ try {
 
 Write-Host "Build successful" -ForegroundColor Green
 Write-Host "Name: $PackName"
-Write-Host "Version: 1.0.4"
+Write-Host "Version: 1.0.5"
 Write-Host "Output: $Output"
