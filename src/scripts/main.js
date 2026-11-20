@@ -10,11 +10,21 @@ import {
 	ModalFormData,
 	MessageFormData
 } from "@minecraft/server-ui";
+import { createGenerator } from "./generation.js";
 
 const CHUNK_SIZE = 16;
-const HALF_CHUNK_SIZE = 8;
 const SELECTION_PROPERTY = "chunk_generator:selection";
-const GENERATING_PROPERTY = "chunk_generator:generating";
+const generator = createGenerator({ world, system, BlockPermutation });
+
+world.afterEvents.worldLoad.subscribe(() => {
+	generator.initialize();
+	void generator.recover();
+});
+world.afterEvents.playerSpawn.subscribe(({ player }) => {
+	system.run(() => { void generator.recover(player); });
+});
+world.afterEvents.playerLeave.subscribe(({ playerId }) => generator.onLeave(playerId));
+system.runInterval(() => generator.tick(), 1);
 
 system.beforeEvents.startup.subscribe(
 	(init) => {
@@ -97,7 +107,7 @@ system.beforeEvents.startup.subscribe(
 				const player = origin.sourceEntity;
 				if (player && player.typeId === "minecraft:player") {
 					system.run(() => {
-						player.setDynamicProperty(GENERATING_PROPERTY, false);
+						generator.stop(player);
 					});
 				}
 			}
@@ -148,7 +158,7 @@ function getSelectionText(selection) {
 function showMainMenu(player) {
 	const selection = getSelection(player);
 	const body = selection ? getSelectionText(selection) : "No Selection.";
-	const generating = player.getDynamicProperty(GENERATING_PROPERTY);
+	const generating = generator.isGenerating(player);
 
 	const form = new ActionFormData()
 		.title("Chunk Generator")
@@ -164,13 +174,13 @@ function showMainMenu(player) {
 		else if (response.selection === 1) extendToPlayer(player);
 		else if (response.selection === 2) clearSelection(player);
 		else if (response.selection === 3) {
-			if (generating) {
-				player.setDynamicProperty(GENERATING_PROPERTY, false);
+			if (generator.isGenerating(player)) {
+				generator.stop(player);
 			} else {
 				confirmAndGenerate(player);
 			}
 		}
-	});
+	}).catch(error => console.warn(`[Chunk Generator] Main menu: ${error}`));
 }
 
 function showEditForm(player) {
@@ -221,10 +231,14 @@ function showEditForm(player) {
 		});
 		player.sendMessage("§aSelection updated.");
 		showMainMenu(player);
-	});
+	}).catch(error => console.warn(`[Chunk Generator] Coordinate form: ${error}`));
 }
 
 function setRadius(player, radius){
+	if (!Number.isSafeInteger(radius) || radius <= 0) {
+		player.sendMessage("§cRadius must be a positive whole number.");
+		return;
+	}
 	const loc = player.location;
 	const selection = {
 		minX: loc.x - radius / 2,
@@ -275,7 +289,7 @@ function confirmAndGenerate(player) {
 
 	const form = new MessageFormData()
 		.title("Confirm Generation")
-		.body(`This will generate and save ${chunkSelection.chunkCount} chunk(s). It may take a while.`)
+		.body(`This will process ${chunkSelection.chunkCount} chunk(s) for saving. It may take a while. The server saves the world separately.`)
 		.button1("Start")
 		.button2("Cancel");
 
@@ -285,116 +299,9 @@ function confirmAndGenerate(player) {
 			return;
 		}
 		startGeneration(player, chunkSelection.minChunkX, chunkSelection.maxChunkX, chunkSelection.minChunkZ, chunkSelection.maxChunkZ, chunkSelection.chunkCount);
-	});
+	}).catch(error => console.warn(`[Chunk Generator] Generation confirmation: ${error}`));
 }
 
-const SECTION_CHUNKS = 8; // process the selection in 8x8-chunk sections
-
-/**
- * Splits the chunk range into SECTION_CHUNKS x SECTION_CHUNKS sections. For
- * each one, opens a ticking area (which forces those chunks to load and
- * simulate with no player nearby), waits for confirmation they're actually
- * loaded, dirties a block in each chunk so it gets picked up by the next
- * autosave, then tears the ticking area down before moving to the next
- * section — keeping us well under the manager's chunk-capacity limit.
- */
-async function startGeneration(player, minChunkX, maxChunkX, minChunkZ, maxChunkZ, total) {
-	const dimension = player.dimension;
-	const manager = world.tickingAreaManager;
-	const minY = dimension.heightRange.min;
-	const maxY = dimension.heightRange.max;
-	const BARRIER = BlockPermutation.resolve("minecraft:barrier");
-	
-	let chunks_generated = 0;
-	let sections_generated = 0;
-	let sectionCount = Math.ceil((maxChunkX - minChunkX)/SECTION_CHUNKS) * Math.ceil((maxChunkZ - minChunkZ)/SECTION_CHUNKS);
-
-	const old_player_loc = player.location;
-	
-	player.setDynamicProperty(GENERATING_PROPERTY, true);
-	
-	for (let section_cx_min = minChunkX; section_cx_min < maxChunkX; section_cx_min += SECTION_CHUNKS) {
-		console.log(`section_cx_min: ${section_cx_min}`);
-		const section_cx_max = Math.min(section_cx_min + SECTION_CHUNKS, maxChunkX);
-		
-		for (let section_cz_min = minChunkZ; section_cz_min < maxChunkZ; section_cz_min += SECTION_CHUNKS) {
-			console.log(`section_cz_min: ${section_cz_min}`);
-			const section_cz_max = Math.min(section_cz_min + SECTION_CHUNKS, maxChunkZ);
-			
-			if (!player.isValid) {
-				console.warn("player is invalid!");
-				return;
-			}
-			
-			if (!player.getDynamicProperty(GENERATING_PROPERTY)) {
-				player.sendMessage(`§aGeneration canceled: ${chunks_generated}/${total} chunks processed.`);
-				return;
-			}
-			
-			sections_generated++;
-			const tickingAreaId = `chunk_generator:section_${sections_generated}`;
-			const options = {
-				dimension,
-				from: {
-					x: section_cx_min * CHUNK_SIZE,
-					y: minY,
-					z: section_cz_min * CHUNK_SIZE
-				},
-				to: {
-					x: section_cx_max * CHUNK_SIZE - 1,
-					y: maxY,
-					z: section_cz_max * CHUNK_SIZE - 1
-				},
-			};
-			player.teleport({
-				x: section_cx_min * CHUNK_SIZE,
-				y: 200,
-				z: section_cz_min * CHUNK_SIZE
-			});
-
-			if (!manager.hasCapacity(options)) {
-				player.sendMessage(`§cSection ${sections_generated}/${sectionCount} is too large for the ticking-area budget — skipped.`);
-				continue;
-			}
-
-			try {
-				console.log("creating ticking area...");
-				await manager.createTickingArea(tickingAreaId, options);
-				console.log("creating ticking area... ok");
-			} catch (e) {
-				player.sendMessage(`§cCouldn't load section ${sections_generated}/${sectionCount}: ${e}`);
-				continue;
-			}
-
-			for (let x = section_cx_min; x < section_cx_max; x++) {
-				console.log(`x: ${x}`);
-				for (let z = section_cz_min; z < section_cz_max; z++) {
-					console.log(`z: ${z}`);
-					const block = dimension.getBlock({
-						x: x * CHUNK_SIZE + HALF_CHUNK_SIZE,
-						y: maxY - 1,
-						z: z * CHUNK_SIZE + HALF_CHUNK_SIZE
-					});
-					if (block === undefined){
-						player.sendMessage(`§cChunk at x=${x * CHUNK_SIZE}, cz=/${z * CHUNK_SIZE} was not loaded`);
-						continue;
-					}
-					const original = block.permutation;
-					block.setPermutation(BARRIER);
-					block.setPermutation(original);
-					chunks_generated++;
-				}
-			}
-
-			console.log("removing ticking area...");
-			manager.removeTickingArea(tickingAreaId);
-			console.log("removing ticking area... ok");
-			player.teleport(old_player_loc);
-			player.sendMessage(`§7Section ${sections_generated}/${sectionCount} done — ${chunks_generated}/${total} chunks so far.`);
-		}
-	}
-	
-	player.setDynamicProperty(GENERATING_PROPERTY, false);
-
-	player.sendMessage(`§aGeneration complete: ${chunks_generated}/${total} chunks processed.`);
+function startGeneration(player, minChunkX, maxChunkX, minChunkZ, maxChunkZ) {
+	return generator.start(player, minChunkX, maxChunkX, minChunkZ, maxChunkZ);
 }
