@@ -113,7 +113,7 @@ test("a second start cannot overwrite the first player's recovery or effects", a
 	assertClean(h);
 });
 
-test("void guard interrupts an unresolved load and returns before its promise settles", async () => {
+test("void guard restores the protected aerial anchor and allows the load to finish", async () => {
 	const loading = deferred();
 	const h = harness({ createArea(id) { if (id.includes("_section_")) return loading.promise; } });
 	const work = h.controller.start(h.player, 0, 1, 0, 1);
@@ -121,11 +121,11 @@ test("void guard interrupts an unresolved load and returns before its promise se
 	h.player.location.y = h.dimension.heightRange.min + 10;
 	h.player.velocity.y = -10;
 	await h.step();
-	assert.deepEqual(h.player.location, h.origin);
+	assert.deepEqual(h.player.location, { x: 0, y: 324, z: 0 });
 	assert.equal(h.player.velocity.y, 0);
-	assert.equal((await h.settle(work)).processed, 0);
+	assert.equal(h.controller.isGenerating(h.player), true);
 	loading.resolve();
-	await h.flush();
+	assert.equal((await h.settle(work)).processed, 1);
 	assertClean(h);
 });
 
@@ -306,7 +306,7 @@ test("effect cleanup failures remain recoverable and do not prevent other cleanu
 });
 
 for (const hazard of ["minecraft:lava", "minecraft:stone", null]) {
-	test(`the watchdog interrupts a loaded obstruction, liquid or unavailable body space: ${hazard}`, async () => {
+	test(`the watchdog restores altitude and continues above terrain or missing data: ${hazard}`, async () => {
 		const loading = deferred();
 		const h = harness({
 			getBlock(location) { if (location.x < 10 && location.y === 200) return hazard; },
@@ -316,10 +316,10 @@ for (const hazard of ["minecraft:lava", "minecraft:stone", null]) {
 		await h.flush();
 		h.player.location = { x: 0.5, y: 200, z: 0.5 };
 		await h.step();
-		assert.deepEqual(h.player.location, h.origin);
-		assert.equal((await h.settle(work)).processed, 0);
+		assert.deepEqual(h.player.location, { x: 0, y: 324, z: 0 });
+		assert.equal(h.controller.isGenerating(h.player), true);
 		loading.resolve();
-		await h.flush();
+		assert.equal((await h.settle(work)).processed, 1);
 		assertClean(h);
 	});
 }

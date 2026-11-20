@@ -79,7 +79,8 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 	const pendingAreas = new Set();
 	const staleAreas = new Set();
 
-	const logError = (context, error) => logger.warn(`[Chunk Generator] ${context}: ${error}`);
+	const errorText = error => typeof error?.message === "string" ? error.message : String(error);
+	const logError = (context, error) => logger.warn(`[Chunk Generator] ${context}: ${errorText(error)}`);
 	function message(player, text) {
 		try { if (player?.isValid) player.sendMessage(text); }
 		catch (error) { logError("Sending a message", error); }
@@ -102,10 +103,12 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		return true;
 	}
 	function removeArea(id) {
-		if (pendingAreas.has(id)) return false;
 		const manager = world.tickingAreaManager;
 		if (manager.hasTickingArea(id)) manager.removeTickingArea(id);
 		if (manager.hasTickingArea(id)) throw new Error(`Ticking area still present: ${id}`);
+		// Removal can reject the native load promise and release its resources.
+		// Keep the late-completion observer and journal until that promise settles.
+		if (pendingAreas.has(id)) return false;
 		staleAreas.delete(id);
 		if (record?.areaIds.includes(id)) {
 			record.areaIds = record.areaIds.filter(value => value !== id);
@@ -115,6 +118,20 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 	}
 	function removeAreas() {
 		for (const id of new Set([...(record?.areaIds ?? []), ...staleAreas])) attempt(`Removing ${id}`, () => removeArea(id));
+	}
+	function recoveryDetails() {
+		if (!record) return "";
+		const tasks = [];
+		if (record.returnPending) tasks.push("player return");
+		if (record.flagPending) tasks.push("generation-state reset");
+		const effects = record.effects.filter(effect => effect.owned).map(effect => effect.typeId);
+		if (effects.length) tasks.push(`temporary effects (${effects.join(", ")})`);
+		if (record.pendingBlock) tasks.push(`air restoration at (${coordinates(record.pendingBlock.location)}) in ${record.pendingBlock.dimensionId}`);
+		const loading = record.areaIds.filter(id => pendingAreas.has(id));
+		const removing = record.areaIds.filter(id => !pendingAreas.has(id));
+		if (loading.length) tasks.push(`${loading.length} ticking-area load(s) still settling`);
+		if (removing.length) tasks.push(`ticking-area removal (${removing.join(", ")})`);
+		return tasks.join("; ") || "recovery journal removal";
 	}
 	function snapshotEffect(player, spec) {
 		const effect = player.getEffect(spec.typeId);
@@ -265,7 +282,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		if (player.dimension.id !== dimension.id ||
 			["x", "y", "z"].some(axis => Math.abs(actual[axis] - location[axis]) > 0.05) ||
 			angleDifference(facing.x, rotation.x) > 0.1 || angleDifference(facing.y, rotation.y) > 0.1) {
-			throw new Error("Teleport position, dimension or orientation did not match the requested return");
+			throw new Error(`Teleport result mismatch: requested ${dimension.id} (${coordinates(location)}), rotation=(${rotation.x.toFixed(3)}, ${rotation.y.toFixed(3)}); actual ${player.dimension.id} (${coordinates(actual)}), rotation=(${facing.x.toFixed(3)}, ${facing.y.toFixed(3)})`);
 		}
 	}
 	function teleport(player, location, dimension, rotation, checkForBlocks) {
@@ -299,6 +316,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		if (job.reason) return;
 		job.reason = reason;
 		job.status = status;
+		job.anchor = undefined;
 		job.resolveCancellation(new GenerationCancelled(reason));
 		emergencyReturn(job.player);
 	}
@@ -321,7 +339,13 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			pendingAreas.delete(id);
 			if (abandoned) {
 				attempt(`Late cleanup of ${id}`, () => removeArea(id));
-				if (!active && !recovering) attempt("Finishing late recovery", finishRecovery);
+				if (!active && !recovering) {
+					const player = attempt("Finding cleanup player", onlinePlayer);
+					if (attempt("Finishing late recovery", finishRecovery)) {
+						message(player, "§7Pending ticking-area cleanup complete.");
+						logger.log("[Chunk Generator] Pending ticking-area cleanup complete.");
+					}
+				}
 			}
 		});
 		let timeoutId;
@@ -452,7 +476,8 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		if (player && player.id !== record.playerId) return false;
 		recovering = true;
 		try {
-			if (player?.isValid && record.travelStarted && !record.returnPending) {
+			if (player?.isValid && record.travelStarted && !record.returnPending &&
+				(record.flagPending || record.effects.some(effect => effect.owned))) {
 				const origin = record.origin;
 				if (player.dimension.id !== origin.dimensionId || ["x", "y", "z"].some(axis => Math.abs(player.location[axis] - origin.location[axis]) > 0.05)) {
 					record.returnPending = true;
@@ -488,10 +513,48 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 				attempt("Resetting generation state", () => resetFlag(player));
 			}
 			removeAreas();
-			attempt("Finishing recovery", finishRecovery);
+			if (attempt("Finishing recovery", finishRecovery)) {
+				message(player, "§7Recovery and cleanup complete.");
+				logger.log("[Chunk Generator] Recovery and cleanup complete.");
+			}
 			recovering = false;
 		}
 		return !record;
+	}
+	function observedBlocks(dimension, location) {
+		if (location.y >= dimension.heightRange.max) return "above block volume";
+		if (location.y < dimension.heightRange.min) return "below dimension bounds";
+		return [0, 1].map(dy => {
+			const position = { x: Math.floor(location.x), y: Math.floor(location.y + dy), z: Math.floor(location.z) };
+			if (position.y >= dimension.heightRange.max) return "above block volume";
+			try { return `${coordinates(position)}=${dimension.getBlock(position)?.typeId ?? "unloaded"}`; }
+			catch (error) { return `${coordinates(position)}=unavailable (${errorText(error)})`; }
+		}).join(", ");
+	}
+	function maintainAnchor(job) {
+		const anchor = job.anchor;
+		if (!anchor) return;
+		const player = job.player;
+		const dimension = player.dimension;
+		const location = { ...player.location };
+		const velocity = player.getVelocity();
+		const details = `section=${anchor.section}, phase=${anchor.phase}, dimension=${dimension.id}, position=(${coordinates(location)}), velocity=(${coordinates(velocity)}), target=(${coordinates(anchor.location)})`;
+		if (dimension.id !== anchor.dimensionId) throw new Error(`[dimension_changed] ${details}; expected ${anchor.dimensionId}`);
+		if (![location.x, location.y, location.z, velocity.x, velocity.y, velocity.z].every(Number.isFinite)) throw new Error(`[invalid_motion] ${details}`);
+		const margin = Math.min(32, (dimension.heightRange.max - dimension.heightRange.min) / 4);
+		const reason = location.y <= dimension.heightRange.min + margin + Math.max(0, -velocity.y) * 4 ? "void_margin" :
+			location.y < anchor.location.y - 1 ? "vertical_drift" :
+			Math.abs(location.x - anchor.location.x) > 2 || Math.abs(location.z - anchor.location.z) > 2 ? "horizontal_drift" : null;
+		if (!reason) return;
+		// Preserve player proximity and stay above the entire block volume.
+		// Correct drift rather than canceling because remote terrain is unloaded
+		// or contains lava. A failure to reach the protected anchor still aborts.
+		try { teleport(player, anchor.location, dimension, player.getRotation(), false); }
+		catch (error) { throw new Error(`[anchor_restore_failed] cause=${reason}; ${details}; ${errorText(error)}`); }
+		if (!anchor.reported) {
+			logger.log(`[Chunk Generator] Anchor corrected (${reason}); ${details}; observed blocks: ${observedBlocks(dimension, location)}. Continuing section.`);
+			anchor.reported = true;
+		}
 	}
 	function tick() {
 		if (!ready || storageError) return;
@@ -506,20 +569,20 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		if (player?.isValid && (active || record.returnPending)) {
 			try {
 				protect(player);
-				if (active) check(active);
-				if (record.returnPending) {
+				if (active) {
+					check(active);
+					maintainAnchor(active);
+				} else if (record.returnPending) {
 					const dimension = player.dimension;
 					const location = player.location;
 					const velocity = player.getVelocity();
-					const margin = Math.min(32, (dimension.heightRange.max - dimension.heightRange.min) / 4);
-					if (dimension.id !== record.origin.dimensionId ||
-						location.y <= dimension.heightRange.min + margin + Math.max(0, -velocity.y) * 4 ||
-						!clearBody(dimension, location, false)) {
-						throw new Error("Unsafe descent, obstruction, liquid, or unloaded player position");
-					}
+					if (dimension.id !== record.origin.dimensionId || location.y < dimension.heightRange.max + 2 || velocity.y < -1) emergencyReturn(player);
 				}
 			} catch (error) {
-				if (active) cancel(active, `${error}`);
+				if (active) {
+					logError(`Watchdog section=${active.anchor?.section ?? "return"}`, error);
+					cancel(active, errorText(error));
+				}
 				else emergencyReturn(player);
 			}
 		} else if (active) cancel(active, "Player disconnected");
@@ -588,10 +651,13 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 						// Retain player proximity BEFORE creating the remote ticking area.
 						// An above-build-volume target cannot contain terrain, even while
 						// unloaded. Never substitute tryTeleport, which requires loading.
-						teleport(player, { x: cx * CHUNK_SIZE, y: dimension.heightRange.max + 4, z: cz * CHUNK_SIZE }, dimension, origin.rotation, false);
+						job.anchor = { location: { x: cx * CHUNK_SIZE, y: dimension.heightRange.max + 4, z: cz * CHUNK_SIZE },
+							dimensionId: dimension.id, section: index, phase: "loading", reported: false };
+						teleport(player, job.anchor.location, dimension, origin.rotation, false);
 						check(job);
 						await loadArea(id, options, job);
 						check(job);
+						job.anchor.phase = "processing";
 						for (let x = cx; x < endX; x++) {
 							for (let z = cz; z < endZ; z++) {
 								check(job);
@@ -608,6 +674,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 						logError(`Section ${index}/${sections}`, error);
 						if (record.pendingBlock) cancel(job, "Temporary block restoration failed", "failed");
 					} finally {
+						job.anchor = undefined;
 						attempt(`Cleaning section ${index}`, () => removeArea(id));
 						if (!attempt("Returning after section", () => returnPlayer(player))) cancel(job, "Return failed; recovery retained", "failed");
 					}
@@ -642,7 +709,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			attempt("Finishing cleanup", finishRecovery);
 			result.recoveryPending = !!record;
 			if (result.recoveryPending && result.status === "complete") result.status = "recovery_pending";
-			const summary = `Generation ${result.status}: ${result.processed}/${total} chunks processed. Sections: ${result.successful} successful, ${result.partial} partial, ${result.failed} failed, ${result.cancelled} canceled, ${result.notStarted} not started. Disk save is not verified.${record ? " Recovery remains pending." : ""}`;
+			const summary = `Generation ${result.status}: ${result.processed}/${total} chunks processed. Sections: ${result.successful} successful, ${result.partial} partial, ${result.failed} failed, ${result.cancelled} canceled, ${result.notStarted} not started. BDS handles world saves.${record ? ` Pending cleanup: ${recoveryDetails()}.` : " Cleanup complete."}`;
 			message(player, `${result.status === "complete" ? "§a" : "§e"}${summary}`);
 			logger.log(`[Chunk Generator] ${summary}`);
 		}

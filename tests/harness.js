@@ -145,6 +145,7 @@ export function harness(options = {}) {
 	h.step = async (count = 1) => {
 		for (let i = 0; i < count; i++) {
 			system.currentTick++;
+			options.tick?.(h);
 			h.controller.tick();
 			for (const [id, timer] of [...timers]) if (timer.at <= system.currentTick) { timers.delete(id); timer.callback(); }
 			await h.flush();

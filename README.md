@@ -4,17 +4,17 @@ Generate and save terrain within a selected area in Minecraft Bedrock.
 
 This fork is based on [aceinetx/Chunk-Generator-Addon](https://github.com/aceinetx/Chunk-Generator-Addon), which builds on the original [Amulet-Team/Chunk-Generator-Addon](https://github.com/Amulet-Team/Chunk-Generator-Addon). The original addon documentation is retained below.
 
-**Version: 1.0.3** · [Download the pack](https://raw.githubusercontent.com/Olrik-WP/Chunk-Generator-Addon/main/ChunkGenerator-aceinetx-v1.0.3.mcpack)
+**Version: 1.0.4** · [Download the pack](https://raw.githubusercontent.com/Olrik-WP/Chunk-Generator-Addon/main/ChunkGenerator-aceinetx-v1.0.4.mcpack)
 
 ## Changes in this fork
 
-- Safer Survival teleports with temporary Resistance V, Slow Falling, velocity reset and a watchdog for dangerous positions.
+- Safer Survival teleports with temporary Resistance V, Slow Falling, velocity reset and a monitored aerial anchor. The player stays above terrain while sections load; recoverable drift is corrected without canceling generation.
 - Verified return to the original position, dimension and orientation, while preserving existing effects.
 - Indoor-friendly starting checks using Minecraft's actual ground support and collision bounds, including fractional standing heights. Return support is recorded and rechecked; refusal messages identify the cause, block and coordinates.
-- Independent cleanup and persistent recovery after errors, cancellation or disconnection.
+- Independent cleanup and persistent recovery after errors, cancellation or disconnection. Pending ticking-area loads are actively removed and still tracked until they settle; cleanup-only recovery does not keep teleporting an already returned player.
 - A global lock to prevent simultaneous generations.
 - Air-only temporary block modifications, with restoration and recovery tracking to protect terrain and containers.
-- Accurate chunk and section counters, clearer progress messages and fewer repetitive logs.
+- Accurate chunk and section counters, precise watchdog diagnostics with phase/position/velocity, explicit pending-cleanup tasks and fewer repetitive logs. World saves remain managed by BDS.
 - A reproducible PowerShell builder for the versioned `.mcpack`.
 
 The inherited player teleports, ticking-area loading, 8 × 8 sections, GUI and four commands are retained. The player stays in Survival; original pack UUIDs and stable API dependencies are preserved. Recovery remains subject to the server running and its saved state.
@@ -27,7 +27,9 @@ Run from the repository root in PowerShell:
 .\generate.ps1
 ```
 
-Output: `ChunkGenerator-aceinetx-v1.0.3.mcpack`.
+Output: `ChunkGenerator-aceinetx-v1.0.4.mcpack`.
+
+Repository workflow and constraints are documented in [AGENTS.md](AGENTS.md).
 
 ## Original addon documentation
 
@@ -44,7 +46,7 @@ This can either be done manually by the user for each chunk they want to save, o
 
 ## How do I install the addon?
 
-1) Download the fork's addon by [clicking here](https://raw.githubusercontent.com/Olrik-WP/Chunk-Generator-Addon/main/ChunkGenerator-aceinetx-v1.0.3.mcpack)
+1) Download the fork's addon by [clicking here](https://raw.githubusercontent.com/Olrik-WP/Chunk-Generator-Addon/main/ChunkGenerator-aceinetx-v1.0.4.mcpack)
 2) Double-click the downloaded file to open it in Minecraft Bedrock Edition.
 3) Open the worlds list in Minecraft Bedrock Edition
 4) Click the pencil icon on the world you want to generate terrain in (or click `Create new world`)
