@@ -11,15 +11,14 @@ const EFFECTS = [
 	{ typeId: "minecraft:slow_falling", amplifier: 0 },
 ];
 
-// Stable 2.8.0 has no general, stable block collision-shape query. Require a
-// known full, harmless support block instead of treating every non-air block
-// (slabs, cactus, containers, custom blocks...) as a safe place to return.
+// Only used when recovering a journal created before 1.0.3. New generations
+// use the engine's actual support and collision queries, not this whitelist.
 const SAFE_SUPPORT = new Set([
 	"stone", "granite", "polished_granite", "diorite", "polished_diorite",
 	"andesite", "polished_andesite", "cobblestone", "mossy_cobblestone",
 	"deepslate", "cobbled_deepslate", "polished_deepslate", "deepslate_bricks",
 	"deepslate_tiles", "tuff", "calcite", "grass_block", "dirt", "coarse_dirt",
-	"rooted_dirt", "clay", "mud", "packed_mud", "mud_bricks", "bedrock",
+	"rooted_dirt", "grass", "clay", "mud", "packed_mud", "mud_bricks", "bedrock",
 	"stonebrick", "stone_bricks", "brick_block", "bricks", "sandstone",
 	"red_sandstone", "quartz_block", "netherrack", "basalt", "smooth_basalt",
 	"blackstone", "polished_blackstone", "nether_brick", "nether_bricks",
@@ -31,6 +30,20 @@ const SAFE_SUPPORT = new Set([
 	"acacia_planks", "dark_oak_planks", "mangrove_planks", "cherry_planks",
 	"bamboo_planks", "crimson_planks", "warped_planks", "pale_oak_planks",
 ].map(id => `minecraft:${id}`));
+const LANDING_HAZARDS = new Set([
+	"water", "flowing_water", "lava", "flowing_lava", "fire", "soul_fire",
+	"cactus", "magma", "magma_block", "campfire", "soul_campfire",
+	"sweet_berry_bush", "wither_rose", "powder_snow", "portal", "nether_portal", "end_portal",
+].map(id => `minecraft:${id}`));
+
+function validLanding(landing) {
+	const point = value => value && ["x", "y", "z"].every(axis => Number.isSafeInteger(value[axis]));
+	if (!landing || !point(landing.from) || !point(landing.to) || !Array.isArray(landing.supports) ||
+		!landing.supports.length || landing.supports.length > 32) return false;
+	const size = ["x", "y", "z"].map(axis => landing.to[axis] - landing.from[axis] + 1);
+	return size.every(length => length > 0 && length <= 8) && size.reduce((a, b) => a * b, 1) <= 128 &&
+		landing.supports.every(cell => point(cell.location) && typeof cell.signature === "string");
+}
 
 class GenerationCancelled extends Error {}
 
@@ -41,6 +54,7 @@ function validRecord(value) {
 		typeof value.jobId === "string" && value.jobId.startsWith(AREA_PREFIX) &&
 		original?.gameMode === "Survival" && typeof original.dimensionId === "string" &&
 		vector(original.location, ["x", "y", "z"]) && vector(original.rotation, ["x", "y"]) &&
+		(original.landing === undefined || validLanding(original.landing)) &&
 		typeof value.returnPending === "boolean" && typeof value.travelStarted === "boolean" && typeof value.flagPending === "boolean" &&
 		Array.isArray(value.areaIds) && value.areaIds.every(id => typeof id === "string" &&
 			(id.startsWith(AREA_PREFIX) || id.startsWith("chunk_generator:section_"))) &&
@@ -155,6 +169,80 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		catch (error) { logError("Waiting for the landing tick", error); }
 		if (player.isValid) restoreEffects(player);
 	}
+	const coordinates = location => `${location.x.toFixed(3)}, ${location.y.toFixed(3)}, ${location.z.toFixed(3)}`;
+	function loadedBlock(dimension, location) {
+		let block;
+		try { block = dimension.getBlock(location); }
+		catch (error) { throw new Error(`Cannot inspect return block at (${coordinates(location)}): ${error.message}`); }
+		if (!block) throw new Error(`Return block is not loaded at (${coordinates(location)})`);
+		return block;
+	}
+	function harmless(block) {
+		if (LANDING_HAZARDS.has(block.typeId) || block.isLiquid || block.isWaterlogged) {
+			throw new Error(`Unsafe return block ${block.typeId} at (${coordinates(block.location)})`);
+		}
+	}
+	function signature(block) {
+		const states = block.permutation.getAllStates();
+		return JSON.stringify([block.typeId, Object.keys(states).sort().map(key => [key, states[key]])]);
+	}
+	function inspectLanding(dimension, landing) {
+		for (let x = landing.from.x; x <= landing.to.x; x++) {
+			for (let y = landing.from.y; y <= landing.to.y; y++) {
+				for (let z = landing.from.z; z <= landing.to.z; z++) harmless(loadedBlock(dimension, { x, y, z }));
+			}
+		}
+		for (const cell of landing.supports) {
+			const block = loadedBlock(dimension, cell.location);
+			if (signature(block) !== cell.signature) throw new Error(`Return support or its neighbor changed at (${coordinates(cell.location)}); current block: ${block.typeId}`);
+		}
+	}
+	function captureLanding(player) {
+		const location = player.location;
+		const aabb = player.getAABB();
+		if (!aabb?.center || !aabb?.extent || !["x", "y", "z"].every(axis => Number.isFinite(aabb.center[axis]) && Number.isFinite(aabb.extent[axis]) && aabb.extent[axis] > 0)) {
+			throw new Error(`Invalid player collision bounds at (${coordinates(location)})`);
+		}
+		if (aabb.extent.y * 2 < 1.7) throw new Error(`Stand upright before starting at (${coordinates(location)}); the current player pose is too low for a standing return`);
+		const supports = player.getAllBlocksStandingOn({ ignoreThinBlocks: false });
+		if (!supports.length || Math.abs(player.getVelocity().y) > 0.05) {
+			const below = { x: Math.floor(location.x), y: Math.floor(aabb.center.y - aabb.extent.y - 0.05), z: Math.floor(location.z) };
+			const feet = attempt("Inspecting block below feet", () => player.dimension.getBlock(below)?.typeId) || "unavailable";
+			throw new Error(`No stable ground at (${coordinates(location)}); below feet=${feet}, detected supports=${supports.map(block => block.typeId).join(",") || "none"}, vertical velocity=${player.getVelocity().y.toFixed(3)}`);
+		}
+		const landing = { from: {}, to: {}, supports: [] };
+		for (const axis of ["x", "y", "z"]) {
+			// Shrink only by numerical epsilon: a wall touching the collision box
+			// is not an intersecting block. Fractional feet positions are valid.
+			landing.from[axis] = Math.floor(aabb.center[axis] - aabb.extent[axis] + 0.00001);
+			landing.to[axis] = Math.floor(aabb.center[axis] + aabb.extent[axis] - 0.00001);
+		}
+		const seen = new Set();
+		for (const support of supports) {
+			harmless(support);
+			// Adjacent states can affect connected stairs, walls and fences.
+			for (const [dx, dz] of [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]]) {
+				const position = { x: support.location.x + dx, y: support.location.y, z: support.location.z + dz };
+				const key = JSON.stringify(position);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				landing.supports.push({ location: position, signature: signature(loadedBlock(player.dimension, position)) });
+			}
+		}
+		if (!validLanding(landing)) throw new Error(`Unsupported player footprint at (${coordinates(location)})`);
+		inspectLanding(player.dimension, landing);
+		return landing;
+	}
+	function probeLanding(player, origin) {
+		if (player.dimension.id !== origin.dimensionId || ["x", "y", "z"].some(axis => Math.abs(player.location[axis] - origin.location[axis]) > 0.02)) {
+			throw new Error(`Player moved while preparing generation; start again from a stationary position (${coordinates(player.location)})`);
+		}
+		inspectLanding(player.dimension, origin.landing);
+		if (!player.tryTeleport(origin.location, { dimension: player.dimension, rotation: origin.rotation, keepVelocity: false, checkForBlocks: true })) {
+			throw new Error(`Bedrock rejected the return collision check at (${coordinates(origin.location)}); no remote teleport was started`);
+		}
+		verifyTeleport(player, origin.location, player.dimension, origin.rotation);
+	}
 	function clearBody(dimension, location, requireSupport) {
 		const { min, max } = dimension.heightRange;
 		if (location.y < min + 2) return false;
@@ -189,7 +277,8 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		if (!player?.isValid) return false;
 		const origin = record.origin;
 		const dimension = world.getDimension(origin.dimensionId);
-		if (!clearBody(dimension, origin.location, true)) throw new Error("Original position is obstructed, unsafe, or not loaded; recovery retained");
+		if (origin.landing) inspectLanding(dimension, origin.landing);
+		else if (!clearBody(dimension, origin.location, true)) throw new Error("Legacy return position is obstructed, unsafe, or not loaded; recovery retained");
 		teleport(player, origin.location, dimension, origin.rotation, true);
 		attempt("Extinguishing fire after return", () => player.extinguishFire());
 		record.returnPending = false;
@@ -260,7 +349,12 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 		};
 	}
 	function homeOptions() {
-		const { location, dimensionId } = record.origin;
+		const { location, dimensionId, landing } = record.origin;
+		if (landing) {
+			const points = [landing.from, landing.to, ...landing.supports.map(cell => cell.location)];
+			return areaOptions(world.getDimension(dimensionId), Math.min(...points.map(p => p.x)), Math.max(...points.map(p => p.x)),
+				Math.min(...points.map(p => p.z)), Math.max(...points.map(p => p.z)));
+		}
 		return areaOptions(world.getDimension(dimensionId),
 			Math.floor(location.x - 1), Math.floor(location.x + 1),
 			Math.floor(location.z - 1), Math.floor(location.z + 1));
@@ -457,9 +551,7 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			if (!player.isValid || player.getGameMode() !== "Survival") throw new Error("Start generation in Survival mode");
 			const dimension = player.dimension;
 			const origin = { location: { ...player.location }, dimensionId: dimension.id, rotation: { ...player.getRotation() }, gameMode: player.getGameMode() };
-			if (Math.abs(origin.location.y - Math.round(origin.location.y)) > 0.01 || !clearBody(dimension, origin.location, true)) {
-				throw new Error("Stand on a supported full block with clear space around you before starting");
-			}
+			origin.landing = captureLanding(player);
 			const effects = EFFECTS.map(spec => ({ ...spec, original: snapshotEffect(player, spec), owned: false }));
 			for (const effect of effects) {
 				if (effect.original && !adequate(effect.original, effect)) throw new Error(`Existing ${effect.typeId} is too weak or expires soon; it was left unchanged.`);
@@ -473,6 +565,8 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			const home = homeOptions();
 			if (!world.tickingAreaManager.hasCapacity(home)) throw new Error("No ticking-area capacity for the return location");
 			await loadArea(homeId, home, job);
+			check(job);
+			probeLanding(player, origin);
 			let index = 0;
 			for (let cx = minChunkX; cx < maxChunkX && !job.reason; cx += SECTION_CHUNKS) {
 				for (let cz = minChunkZ; cz < maxChunkZ && !job.reason; cz += SECTION_CHUNKS) {
@@ -530,8 +624,9 @@ export function createGenerator({ world, system, BlockPermutation, logger = cons
 			result.status = job.reason ? job.status : result.processed === total ? "complete" : result.processed ? "partial" : "failed";
 		} catch (error) {
 			result.status = error instanceof GenerationCancelled ? "cancelled" : "failed";
-			message(player, `§cGeneration stopped: ${error.message}`);
-			logError("Generation stopped", error);
+			const context = record?.travelStarted ? "Generation stopped" : "Cannot start generation";
+			message(player, `§c${context}: ${error.message}`);
+			logError(context, error);
 		} finally {
 			if (record) {
 				attempt("Restoring pending air block", repairBlock);

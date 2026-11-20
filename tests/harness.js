@@ -33,7 +33,7 @@ export function harness(options = {}) {
 				const key = `${id}:${location.x},${location.y},${location.z}`;
 				if (!blocks.has(key)) {
 					const nearHome = Math.abs(location.x - origin.x) <= 1 && Math.abs(location.z - origin.z) <= 1;
-					let permutation = { type: { id: override ?? (nearHome && location.y === Math.floor(origin.y - 0.01) ? "minecraft:stone" : "minecraft:air") } };
+					let permutation = { type: { id: override ?? (nearHome && location.y === Math.floor(origin.y - 0.01) ? "minecraft:stone" : "minecraft:air") }, getAllStates() { return options.blockStates?.(location, id, h) ?? {}; } };
 					const block = {
 						location: { ...location }, dimension: result, payload: { example: "container contents" },
 						get typeId() { return permutation.type.id; },
@@ -71,6 +71,22 @@ export function harness(options = {}) {
 		setGameMode() { throw new Error("Game mode must never be changed"); },
 		extinguishFire() { events.push({ kind: "extinguish" }); },
 		getRotation() { return { ...this.rotation }; }, getVelocity() { return { ...this.velocity }; },
+		getAABB() {
+			const height = options.playerHeight ?? 1.8;
+			return { center: { x: this.location.x, y: this.location.y + height / 2, z: this.location.z }, extent: { x: 0.3, y: height / 2, z: 0.3 } };
+		},
+		getAllBlocksStandingOn() {
+			if (options.standingOn) return options.standingOn(h);
+			const block = this.dimension.getBlock({ x: Math.floor(this.location.x), y: Math.floor(this.location.y - 0.01), z: Math.floor(this.location.z) });
+			return block && block.typeId !== "minecraft:air" ? [block] : [];
+		},
+		tryTeleport(location, settings) {
+			events.push({ kind: "collision-probe", location, settings, protected: !!getEffect("minecraft:resistance") && !!getEffect("minecraft:slow_falling") });
+			if (options.collisionProbe?.(location, settings, h) === false) return false;
+			this.location = { ...location }; this.dimension = settings.dimension; this.rotation = { ...settings.rotation };
+			this.velocity = { x: 0, y: 0, z: 0 };
+			return true;
+		},
 		getDynamicProperty(key) { if (!this.isValid) throw new Error("Invalid player"); return playerProperties.get(key); },
 		setDynamicProperty(key, value) { if (!this.isValid) throw new Error("Invalid player"); playerProperties.set(key, value); },
 		getEffect,
@@ -120,7 +136,7 @@ export function harness(options = {}) {
 		getAllPlayers() { return player.isValid ? [player] : []; },
 	};
 	const logger = { log(text) { events.push({ kind: "log", text }); }, warn(text) { events.push({ kind: "warning", text }); } };
-	const BlockPermutation = { resolve: typeId => ({ type: { id: typeId } }) };
+	const BlockPermutation = { resolve: typeId => ({ type: { id: typeId }, getAllStates() { return {}; } }) };
 	Object.assign(h, { world, system, player, dimension: initialDimension, logger, BlockPermutation });
 	h.controller = createGenerator({ world, system, BlockPermutation, logger });
 	h.controller.initialize();
